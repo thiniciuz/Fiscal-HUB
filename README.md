@@ -41,7 +41,7 @@ Documentacao resumida em `docs/API.md`.
 Plano de evolucao em `docs/ROADMAP.md`.
 
 ## Demo visual
-Adicione capturas em `docs/screenshots/` e atualize os links abaixo:
+Capturas em `docs/screenshots/`:
 - Login: `docs/screenshots/login.png`
 - Home: `docs/screenshots/home.png`
 - Empresas: `docs/screenshots/empresas.png`
