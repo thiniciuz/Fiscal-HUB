@@ -65,6 +65,18 @@ function readStoredActive() {
   return localStorage.getItem(UI_ACTIVE_KEY) || sessionStorage.getItem(UI_ACTIVE_KEY) || "home";
 }
 
+function friendlyApiError(error, fallback = "Falha ao entrar") {
+  const raw = error?.message ? String(error.message) : "";
+  if (!raw) return fallback;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed.detail === "string" && parsed.detail.trim()) {
+      return parsed.detail.trim();
+    }
+  } catch (_) {}
+  if (/failed to fetch/i.test(raw)) return "Não foi possível conectar ao servidor.";
+  return raw.length <= 180 ? raw : fallback;
+}
 function readStoredCompanyId() {
   const raw = localStorage.getItem(UI_COMPANY_KEY) || sessionStorage.getItem(UI_COMPANY_KEY);
   const id = Number(raw);
@@ -413,7 +425,7 @@ function Login({ onSelect }) {
 
       .then((logged) => onSelect(logged, remember))
 
-      .catch(() => setError("Senha inválida"));
+      .catch((err) => setError(friendlyApiError(err, "Senha inválida")));
 
   };
 

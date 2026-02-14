@@ -72,6 +72,25 @@ LOGIN_MAX_ATTEMPTS = max(3, _read_env_int("FISCAL_LOGIN_MAX_ATTEMPTS", 8))
 _LOGIN_ATTEMPTS: dict[str, dict[str, float]] = {}
 
 
+def _cors_origins() -> list[str]:
+    defaults = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://tauri.localhost",
+        "http://tauri.localhost",
+        "tauri://localhost",
+    ]
+    raw = str(os.environ.get("FISCAL_CORS_ORIGINS") or "").strip()
+    if not raw:
+        return defaults
+    extras = [item.strip() for item in raw.split(",") if item.strip()]
+    out: list[str] = []
+    for origin in defaults + extras:
+        if origin not in out:
+            out.append(origin)
+    return out
+
+
 def _easter_sunday(year: int) -> date:
     # Meeus/Jones/Butcher
     a = year % 19
@@ -375,7 +394,7 @@ def _clear_login_failures(key: str) -> None:
 app = FastAPI(title="41 Fiscal Hub API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
