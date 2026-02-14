@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+
+# Virtual env
+.venv/
+venv/
+ENV/
+
+# Packaging
+*.egg-info/
+dist/
+build/
+
+# Local DB / runtime
+*.db
+
+# Editor
+.vscode/

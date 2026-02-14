@@ -1,0 +1,53 @@
+﻿# OS / Editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+.vs/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Archives / local dumps
+*.zip
+*.7z
+*.rar
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Node
+node_modules/
+**/node_modules/
+
+# Build artifacts
+web/dist/
+desktop/src-tauri/target/
+dist/
+build/
+
+# Runtime / local DB / temp
+*.db
+*.sqlite
+*.sqlite3
+*.tmp
+*.temp
+
+# Secrets / env
+.env
+.env.*
+!.env.example
