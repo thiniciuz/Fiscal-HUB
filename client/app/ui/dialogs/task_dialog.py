@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional
@@ -36,7 +36,7 @@ def _parse_comp_any(s: str) -> Optional[str]:
 
 
 def _is_managed_attachment(path: str) -> bool:
-    """Garante que só apagamos PDFs que o app gerencia (pasta attachments do APPDATA)."""
+    """Garante que sÃ³ apagamos PDFs que o app gerencia (pasta attachments do APPDATA)."""
     if not path:
         return False
     try:
@@ -45,7 +45,7 @@ def _is_managed_attachment(path: str) -> bool:
         if not p.is_absolute():
             p = get_attachments_dir() / p
         target = str(p.resolve())
-        # commonpath é mais seguro que startswith (evita falsos positivos do tipo .../attachments2)
+        # commonpath Ã© mais seguro que startswith (evita falsos positivos do tipo .../attachments2)
         import os
         return (
             Path(target).suffix.lower() == ".pdf"
@@ -56,7 +56,7 @@ def _is_managed_attachment(path: str) -> bool:
 
 
 class TaskDialog(QDialog):
-    """Dialog de criação/edição de tarefa com anexo PDF opcional (máx 1 por tarefa)."""
+    """Dialog de criaÃ§Ã£o/ediÃ§Ã£o de tarefa com anexo PDF opcional (mÃ¡x 1 por tarefa)."""
 
     def __init__(self, user_id: int, parent=None, task: Optional[Task] = None):
         super().__init__(parent)
@@ -69,8 +69,8 @@ class TaskDialog(QDialog):
         self.new_id: Optional[int] = None
 
         # Estado do PDF:
-        # - _selected_pdf: caminho de origem escolhido pelo usuário (a ser lido e salvo no DB)
-        # - _clear_pdf: usuário pediu remover anexo
+        # - _selected_pdf: caminho de origem escolhido pelo usuÃ¡rio (a ser lido e salvo no DB)
+        # - _clear_pdf: usuÃ¡rio pediu remover anexo
         self._selected_pdf: Optional[str] = None
         self._clear_pdf = False
 
@@ -85,8 +85,8 @@ class TaskDialog(QDialog):
         self.ed_titulo = QLineEdit()
 
         self.cmb_tipo = QComboBox()
-        self.cmb_tipo.addItem("Obrigação", "OBR")
-        self.cmb_tipo.addItem("Acessória", "ACS")
+        self.cmb_tipo.addItem("ObrigaÃ§Ã£o", "OBR")
+        self.cmb_tipo.addItem("AcessÃ³ria", "ACS")
 
         self.cmb_orgao = QComboBox()
         self.cmb_orgao.addItem("Municipal", "MUN")
@@ -106,7 +106,7 @@ class TaskDialog(QDialog):
         pdf_row = QHBoxLayout()
         self.lbl_pdf = QLabel("(nenhum)")
         self.lbl_pdf.setObjectName("Muted")
-        self.btn_pick_pdf = QPushButton("Selecionar PDF…")
+        self.btn_pick_pdf = QPushButton("Selecionar PDFâ€¦")
         self.btn_pick_pdf.clicked.connect(self._pick_pdf)
         self.btn_clear_pdf = QPushButton("Remover")
         self.btn_clear_pdf.setVisible(False)
@@ -116,25 +116,25 @@ class TaskDialog(QDialog):
         pdf_row.addWidget(self.btn_clear_pdf)
 
         form.addRow("Empresa", self.cmb_company)
-        form.addRow("Título", self.ed_titulo)
+        form.addRow("TÃ­tulo", self.ed_titulo)
         form.addRow("Tipo", self.cmb_tipo)
-        form.addRow("Órgão", self.cmb_orgao)
+        form.addRow("Ã“rgÃ£o", self.cmb_orgao)
         form.addRow("Tributo", self.ed_tributo)
-        form.addRow("Competência", self.ed_comp)
+        form.addRow("CompetÃªncia", self.ed_comp)
         form.addRow("Status", self.cmb_status)
         form.addRow("PDF (opcional)", pdf_row)
 
         lay.addLayout(form)
 
         btns = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        # Botões com "ícones" (emoji) para combinar com o estilo do app
+        # BotÃµes com "Ã­cones" (emoji) para combinar com o estilo do app
         _save_btn = btns.button(QDialogButtonBox.Save)
         if _save_btn:
-            _save_btn.setText("✔")
+            _save_btn.setText("âœ”")
             _save_btn.setToolTip("Salvar")
         _cancel_btn = btns.button(QDialogButtonBox.Cancel)
         if _cancel_btn:
-            _cancel_btn.setText("❌")
+            _cancel_btn.setText("âŒ")
             _cancel_btn.setToolTip("Cancelar")
 
         btns.accepted.connect(self._save)
@@ -192,7 +192,7 @@ class TaskDialog(QDialog):
         self.btn_clear_pdf.setVisible(False)
 
     def _on_comp_changed(self, text: str) -> None:
-        # Auto-inserir "/" após MM
+        # Auto-inserir "/" apÃ³s MM
         t = text.strip()
         if len(t) == 2 and t.isdigit():
             self.ed_comp.blockSignals(True)
@@ -213,7 +213,7 @@ class TaskDialog(QDialog):
             comp_raw = self.ed_comp.text()
             comp = _parse_comp_any(comp_raw)
             if comp_raw.strip() and comp is None:
-                raise ValueError("Compet?ncia inv?lida. Use MM/AAAA.")
+                raise ValueError("Competência inválida. Use MM/AAAA.")
             status: TaskStatus = str(self.cmb_status.currentData())  # type: ignore[assignment]
 
             # Resolve pdf_path final
@@ -247,7 +247,7 @@ class TaskDialog(QDialog):
                     pdf_blob=pdf_blob_final,
                 )
 
-                # Se trocou ou removeu PDF, apaga o antigo para não acumular anexos.
+                # Se trocou ou removeu PDF, apaga o antigo para nÃ£o acumular anexos.
                 if (
                     old_pdf
                     and (self._clear_pdf or (pdf_path_final and pdf_path_final != old_pdf))
@@ -274,3 +274,4 @@ class TaskDialog(QDialog):
             return
 
         self.accept()
+

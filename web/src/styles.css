@@ -1,4 +1,4 @@
-:root {
+﻿:root {
   --bg: #0b1220;
   --panel: #0f172a;
   --card: rgba(15, 23, 42, 0.65);
@@ -89,19 +89,37 @@ body {
 
 .sidebar .collapse {
   position: absolute;
-  top: 18px;
-  right: -14px;
-  width: 28px;
-  height: 28px;
+  top: 12px;
+  right: 10px;
+  width: 32px;
+  height: 32px;
   padding: 0;
-  background: var(--panel);
-  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--panel) 88%, #1d4ed8 12%);
+  border: 1px solid rgba(59, 130, 246, 0.45);
   color: var(--text);
   border-radius: 999px;
   cursor: pointer;
   display: grid;
   place-items: center;
-  box-shadow: 0 6px 16px rgba(2, 6, 23, 0.25);
+  box-shadow: 0 8px 18px rgba(2, 6, 23, 0.28);
+  transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+  z-index: 3;
+}
+
+.sidebar .collapse:hover {
+  transform: translateY(-1px);
+  border-color: rgba(59, 130, 246, 0.8);
+  box-shadow: 0 10px 20px rgba(2, 6, 23, 0.35);
+}
+
+.collapse-icon {
+  width: 16px;
+  height: 16px;
+  stroke: currentColor;
+  stroke-width: 2.5;
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .sidebar nav button {
@@ -161,8 +179,12 @@ body {
 }
 
 .sidebar.collapsed nav button::after {
-  content: "•";
-  font-size: 18px;
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: currentColor;
+  display: inline-block;
 }
 
 .sidebar.collapsed .logout-btn {
@@ -1334,3 +1356,5 @@ body[data-theme="light"] .sidebar nav button.active {
   font-size: 12px;
   line-height: 1;
 }
+
+

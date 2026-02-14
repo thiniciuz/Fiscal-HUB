@@ -16,7 +16,7 @@ const STATUS_LABELS = {
 
   EM_ANDAMENTO: "Em andamento",
 
-  CONCLUIDA: "Conclu?da",
+  CONCLUIDA: "Concluída",
 
   ENVIADA: "Enviada",
 
@@ -147,6 +147,25 @@ function sortCommentsNewest(items) {
 }
 
 
+
+function normalizeBrokenText(value) {
+  return String(value || "")
+    .replace(/conclu\?da/gi, "concluída")
+    .replace(/compet\?ncia/gi, "competência")
+    .replace(/inv\?lida/gi, "inválida")
+    .replace(/pend\?ncia/gi, "pendência")
+    .replace(/notifica\?{1,2}o/gi, "notificação")
+    .replace(/n\?o/gi, "não");
+}
+
+function notificationTypeMeta(notification) {
+  const type = String(notification?.type || "").toLowerCase();
+  if (type === "comment") return { label: "Comentário", statusChip: "EM_ANDAMENTO" };
+  if (type === "comment_ack") return { label: "Comentário lido", statusChip: "EM_ANDAMENTO" };
+  if (type === "resolved") return { label: "Resolvida", statusChip: "CONCLUIDA" };
+  if (type === "inconsistency") return { label: "Inconsistência", statusChip: "PENDENTE" };
+  return { label: "Notificação", statusChip: "PENDENTE" };
+}
 
 function parseCompLabel(label) {
 
@@ -309,8 +328,15 @@ function Sidebar({ active, onNavigate, collapsed, onToggle, userRole, onLogout }
 
           />
 
-        <button className="collapse" onClick={onToggle} title={collapsed ? "Expandir" : "Recolher"}>
-          {collapsed ? ">" : "<"}
+        <button
+          className="collapse"
+          onClick={onToggle}
+          title={collapsed ? "Expandir menu lateral" : "Recolher menu lateral"}
+          aria-label={collapsed ? "Expandir menu lateral" : "Recolher menu lateral"}
+        >
+          <svg className="collapse-icon" viewBox="0 0 24 24" aria-hidden="true">
+            {collapsed ? <path d="m9 6 6 6-6 6" /> : <path d="m15 6-6 6 6 6" />}
+          </svg>
         </button>
 
       </div>
@@ -456,6 +482,7 @@ function Login({ onSelect }) {
 
 function HomePage({
   userId,
+  userName,
   donutScope,
   onDonutScopeChange,
   companyScope,
@@ -611,7 +638,7 @@ function HomePage({
       <div className="page-header">
         <div>
           <h1>Home</h1>
-          <div className="page-subtitle">Visão operacional por status, empresa e tarefas ({scopeLabel(activeHomeScope)}).</div>
+          <div className="page-subtitle">Bem vindo, {userName || "Usuário"}.</div>
         </div>
         <div className="home-header-actions">
           <button
@@ -746,24 +773,10 @@ function HomePage({
                     title={notificationTaskId(n) ? "Dê dois cliques para abrir a tarefa" : ""}
                   >
                     <div className="notification-main">
-                      <span
-                        className={`status-chip ${
-                          String(n.type).toLowerCase() === "resolved"
-                            ? "CONCLUIDA"
-                            : String(n.type).toLowerCase() === "comment" || String(n.type).toLowerCase() === "comment_ack"
-                            ? "EM_ANDAMENTO"
-                            : "PENDENTE"
-                        }`}
-                      >
-                        {String(n.type).toLowerCase() === "comment"
-                          ? "Comentário"
-                          : String(n.type).toLowerCase() === "comment_ack"
-                          ? "Conferido"
-                          : String(n.type).toLowerCase() === "resolved"
-                          ? "Resolvida"
-                          : "Inconsistência"}
+                      <span className={`status-chip ${notificationTypeMeta(n).statusChip}`}>
+                        {notificationTypeMeta(n).label}
                       </span>
-                      <div className="notification-message">{n.message}</div>
+                      <div className="notification-message">{normalizeBrokenText(n.message)}</div>
                       <div className="muted small">{fmtDateTime(n.created_at)}</div>
                     </div>
                   </div>
@@ -1817,7 +1830,7 @@ function Dashboard({ userId, company, onBack, userRole, competenciaScope, initia
                     <span />
                   )}
 
-                  <span className={`status-chip ${t.status || ""}`}>{STATUS_LABELS[t.status] || t.status}</span>
+                  <span className={`status-chip ${t.status}`}>{STATUS_LABELS[t.status]}</span>
 
                 </div>
 
@@ -2945,6 +2958,8 @@ export default function App() {
 
           userId={user.id}
 
+          userName={user.nome}
+
           donutScope={donutScope}
 
           onDonutScopeChange={setDonutScope}
@@ -3157,6 +3172,11 @@ function DonutChart({ segments, total, onSelect }) {
   );
 
 }
+
+
+
+
+
 
 
 
