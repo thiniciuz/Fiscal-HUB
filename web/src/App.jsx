@@ -1,6 +1,6 @@
-﻿import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 
-import { api } from "./api.js";
+import { api, setAuthToken } from "./api.js";
 
 import logoFull from "./assets/logo_full.png";
 
@@ -53,7 +53,9 @@ function readStoredUser() {
   const raw = local || session;
   if (!raw) return null;
   try {
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    if (!parsed?.access_token) return null;
+    return parsed;
   } catch (_) {
     return null;
   }
@@ -1374,10 +1376,13 @@ function Dashboard({ userId, company, onBack, userRole, competenciaScope, initia
 
 
 
-  const openPdf = (task) => window.open(api.getPdfUrl(task.id, userId), "_blank");
-
-
-
+  const openPdf = async (task) => {
+    try {
+      await api.openPdf(task.id, userId);
+    } catch (e) {
+      alert(e?.message ? String(e.message) : "Falha ao abrir PDF.");
+    }
+  };
   const toggleStatus = (s) => {
 
     setStatusFilter((prev) => {
@@ -2619,7 +2624,7 @@ function SettingsPage({ theme, onThemeChange, user }) {
     smtp_sender: "",
     smtp_tls: true,
   });
-  const [userForm, setUserForm] = useState({ nome: "", senha: "1234", role: "collab" });
+  const [userForm, setUserForm] = useState({ nome: "", senha: "", role: "collab" });
   const [msg, setMsg] = useState("");
 
   useEffect(() => {
@@ -2646,13 +2651,17 @@ function SettingsPage({ theme, onThemeChange, user }) {
       setMsg("Informe o nome do colaborador.");
       return;
     }
+    if (String(userForm.senha || "").trim().length < 8) {
+      setMsg("A senha deve ter no minimo 8 caracteres.");
+      return;
+    }
     await api.createUser({
       nome: userForm.nome.trim(),
-      senha: userForm.senha || "1234",
+      senha: userForm.senha,
       role: userForm.role || "collab",
       is_default: false,
     });
-    setUserForm({ nome: "", senha: "1234", role: "collab" });
+    setUserForm({ nome: "", senha: "", role: "collab" });
     setMsg("Login criado com sucesso.");
   };
 
@@ -2759,7 +2768,7 @@ function SettingsPage({ theme, onThemeChange, user }) {
                 onChange={(e) => setUserForm({ ...userForm, nome: e.target.value })}
               />
               <input
-                placeholder="Senha"
+                placeholder="Senha (mín. 8 caracteres)"
                 value={userForm.senha}
                 onChange={(e) => setUserForm({ ...userForm, senha: e.target.value })}
               />
@@ -2811,6 +2820,9 @@ export default function App() {
   const [menuRefreshTick, setMenuRefreshTick] = useState(0);
   const [unreadCount, setUnreadCount] = useState(0);
   const [hasRestoredCompany, setHasRestoredCompany] = useState(false);
+  useEffect(() => {
+    setAuthToken(user?.access_token || null);
+  }, [user?.access_token]);
 
 
 
@@ -2854,6 +2866,7 @@ export default function App() {
   useEffect(() => {
     if (!user?.id) {
       setUnreadCount(0);
+      setAuthToken(null);
       return;
     }
     let alive = true;
@@ -2895,6 +2908,7 @@ export default function App() {
 
   const handleLogin = (logged, remember) => {
     setUser(logged);
+    setAuthToken(logged?.access_token || null);
     localStorage.setItem(AUTH_REMEMBER_KEY, remember ? "1" : "0");
     const payload = JSON.stringify(logged);
     if (remember) {
@@ -2905,6 +2919,7 @@ export default function App() {
       localStorage.removeItem(AUTH_STORAGE_KEY);
     }
   };
+
 
   useEffect(() => {
     const value = String(active || "home");
@@ -3026,6 +3041,7 @@ export default function App() {
     setLinkedTask(null);
     setActive("home");
     setUnreadCount(0);
+    setAuthToken(null);
     localStorage.removeItem(AUTH_STORAGE_KEY);
     sessionStorage.removeItem(AUTH_STORAGE_KEY);
     localStorage.removeItem(UI_COMPANY_KEY);
@@ -3172,12 +3188,3 @@ function DonutChart({ segments, total, onSelect }) {
   );
 
 }
-
-
-
-
-
-
-
-
-

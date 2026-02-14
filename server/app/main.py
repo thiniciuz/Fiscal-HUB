@@ -1,15 +1,18 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from typing import Optional, List
 from datetime import date, timedelta
 import calendar
 import io
+import os
 import re
+import time
 
 import pdfplumber
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from .db import init_db, _connect
 from .schemas import (
@@ -17,6 +20,7 @@ from .schemas import (
     UserCreate,
     UserRoleUpdate,
     UserLogin,
+    AuthLoginOut,
     CompanyOut,
     CompanyCreate,
     CompanyUpdate,
@@ -44,9 +48,28 @@ from .repositories import (
     SettingsRepository,
 )
 from .classifier import classify_filename, save_classification_json
+from .auth import create_access_token, decode_access_token
 
 
 _LAST_MONTHLY_SYNC: Optional[str] = None
+
+
+def _read_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+MAX_PDF_MB = max(1, _read_env_int("FISCAL_MAX_PDF_MB", 10))
+MAX_PDF_BYTES = MAX_PDF_MB * 1024 * 1024
+
+LOGIN_WINDOW_SECONDS = max(30, _read_env_int("FISCAL_LOGIN_WINDOW_SECONDS", 300))
+LOGIN_MAX_ATTEMPTS = max(3, _read_env_int("FISCAL_LOGIN_MAX_ATTEMPTS", 8))
+_LOGIN_ATTEMPTS: dict[str, dict[str, float]] = {}
 
 
 def _easter_sunday(year: int) -> date:
@@ -222,10 +245,6 @@ def _can_edit(role: str) -> bool:
     return role in {"admin", "collab"}
 
 
-def _require_admin(user_id: int) -> None:
-    if _get_role(user_id) != "admin":
-        raise HTTPException(status_code=403, detail="Apenas admin pode alterar configurações.")
-
 
 def _normalize_cnpj(value: str) -> Optional[str]:
     digits = re.sub(r"\D", "", value or "")
@@ -274,6 +293,84 @@ def _match_tributo(text: str, tributo: Optional[str]) -> Optional[bool]:
         return None
     return needle in hay
 
+bearer_scheme = HTTPBearer(auto_error=False)
+_PUBLIC_PATHS = {"/health", "/auth/login"}
+_PUBLIC_PREFIXES = ("/docs", "/redoc", "/openapi.json")
+
+
+def _build_auth_user_from_payload(payload: dict) -> dict:
+    user_id = int(payload.get("sub") or 0)
+    user = UserRepository().get(user_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Usuario do token nao encontrado")
+    return {
+        "id": int(user["id"]),
+        "nome": str(user["nome"]),
+        "role": str(user.get("role") or "collab"),
+        "is_default": bool(user.get("is_default")),
+    }
+
+
+def _optional_auth_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme)) -> Optional[dict]:
+    if credentials is None:
+        return None
+    payload = decode_access_token(credentials.credentials)
+    return _build_auth_user_from_payload(payload)
+
+def _require_auth_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme)) -> dict:
+    auth_user = _optional_auth_user(credentials)
+    if not auth_user:
+        raise HTTPException(status_code=401, detail="Autenticação obrigatória")
+    return auth_user
+
+
+def _require_admin_user(auth_user: dict) -> None:
+    if str(auth_user.get("role") or "") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admin pode executar esta ação.")
+
+
+def _resolve_query_user_id(auth_user: dict, requested_user_id: Optional[int]) -> int:
+    actor_id = int(auth_user["id"])
+    if requested_user_id is None:
+        return actor_id
+    requested = int(requested_user_id)
+    if requested == actor_id:
+        return actor_id
+    if str(auth_user.get("role") or "") == "admin":
+        return requested
+    raise HTTPException(status_code=403, detail="Sem permissão para atuar em nome de outro usuário.")
+
+
+def _login_attempt_key(request: Request, nome: str) -> str:
+    forwarded = str(request.headers.get("x-forwarded-for") or "").split(",", 1)[0].strip()
+    host = forwarded or (request.client.host if request.client else "unknown")
+    login_name = str(nome or "").strip().lower()
+    return f"{host}:{login_name}"
+
+
+def _is_login_rate_limited(key: str) -> bool:
+    entry = _LOGIN_ATTEMPTS.get(key)
+    if not entry:
+        return False
+    now = time.time()
+    if now - entry["first"] > LOGIN_WINDOW_SECONDS:
+        _LOGIN_ATTEMPTS.pop(key, None)
+        return False
+    return entry["count"] >= LOGIN_MAX_ATTEMPTS
+
+
+def _register_login_failure(key: str) -> None:
+    now = time.time()
+    entry = _LOGIN_ATTEMPTS.get(key)
+    if (not entry) or (now - entry["first"] > LOGIN_WINDOW_SECONDS):
+        _LOGIN_ATTEMPTS[key] = {"first": now, "count": 1}
+        return
+    entry["count"] += 1
+
+
+def _clear_login_failures(key: str) -> None:
+    _LOGIN_ATTEMPTS.pop(key, None)
+
 
 app = FastAPI(title="41 Fiscal Hub API")
 app.add_middleware(
@@ -283,6 +380,49 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def auth_guard(request: Request, call_next):
+    method = request.method.upper()
+    path = (request.url.path or "/").rstrip("/") or "/"
+
+    if method == "OPTIONS":
+        return await call_next(request)
+
+    if path in _PUBLIC_PATHS or any(path.startswith(prefix) for prefix in _PUBLIC_PREFIXES):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        return response
+
+    if path == "/users" and method == "POST" and UserRepository().count() == 0:
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        return response
+
+    auth_header = str(request.headers.get("authorization") or "")
+    if not auth_header.lower().startswith("bearer "):
+        return JSONResponse(status_code=401, content={"detail": "Autenticacao obrigatoria"})
+
+    token = auth_header.split(" ", 1)[1].strip()
+    if not token:
+        return JSONResponse(status_code=401, content={"detail": "Token ausente"})
+
+    try:
+        payload = decode_access_token(token)
+        request.state.auth_user = _build_auth_user_from_payload(payload)
+    except HTTPException as exc:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    return response
 
 
 @app.on_event("startup")
@@ -299,11 +439,13 @@ def health():
 
 @app.post("/maintenance/sync-monthly")
 def maintenance_sync_monthly(
-    user_id: int = Query(...),
+    user_id: Optional[int] = Query(None),
     year: Optional[int] = Query(None),
     month: Optional[int] = Query(None),
+    auth_user: dict = Depends(_require_auth_user),
 ):
-    _require_admin(user_id)
+    _require_admin_user(auth_user)
+    _resolve_query_user_id(auth_user, user_id)
     if (year is None) != (month is None):
         raise HTTPException(status_code=400, detail="Informe ano e mês juntos, ou nenhum.")
     if year is None and month is None:
@@ -318,7 +460,9 @@ def maintenance_sync_monthly(
 
 
 @app.get("/users", response_model=List[UserOut])
-def list_users():
+def list_users(auth_user: dict = Depends(_require_auth_user)):
+    if auth_user["role"] not in {"admin", "manager"}:
+        raise HTTPException(status_code=403, detail="Sem permissão para listar usuários.")
     repo = UserRepository()
     rows = repo.list()
     return [
@@ -331,35 +475,67 @@ def list_users():
 
 
 @app.post("/users", response_model=UserOut)
-def create_user(payload: UserCreate):
+def create_user(payload: UserCreate, auth_user: Optional[dict] = Depends(_optional_auth_user)):
     repo = UserRepository()
-    new_id = repo.create(payload.nome, role=payload.role, is_default=payload.is_default, senha=payload.senha)
+    senha = str(payload.senha or "").strip()
+    if len(senha) < 8:
+        raise HTTPException(status_code=400, detail="Senha deve ter no minimo 8 caracteres.")
+
+    if repo.count() == 0:
+        role = payload.role if payload.role in {"admin", "manager", "collab"} else "admin"
+        new_id = repo.create(payload.nome, role=role, is_default=True, senha=senha)
+        return {"id": new_id, "nome": payload.nome, "role": role, "is_default": True}
+
+    if not auth_user:
+        raise HTTPException(status_code=401, detail="Autenticação obrigatória")
+    _require_admin_user(auth_user)
+
+    new_id = repo.create(payload.nome, role=payload.role, is_default=payload.is_default, senha=senha)
     return {"id": new_id, "nome": payload.nome, "role": payload.role, "is_default": payload.is_default}
 
 
-@app.post("/auth/login", response_model=UserOut)
-def login(payload: UserLogin):
+@app.post("/auth/login", response_model=AuthLoginOut)
+def login(payload: UserLogin, request: Request):
+    attempt_key = _login_attempt_key(request, payload.nome)
+    if _is_login_rate_limited(attempt_key):
+        raise HTTPException(status_code=429, detail="Muitas tentativas. Aguarde e tente novamente.")
+
     repo = UserRepository()
     user = repo.verify_login(payload.nome, payload.senha)
     if not user:
+        _register_login_failure(attempt_key)
         raise HTTPException(status_code=401, detail="Credenciais inválidas")
-    return {
+
+    _clear_login_failures(attempt_key)
+    user_out = {
         "id": int(user["id"]),
         "nome": str(user["nome"]),
         "role": str(user.get("role") or "collab"),
         "is_default": bool(user.get("is_default")),
     }
+    token = create_access_token(
+        user_id=int(user_out["id"]),
+        nome=str(user_out["nome"]),
+        role=str(user_out["role"]),
+    )
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": user_out,
+    }
 
 
 @app.post("/users/{user_id}/default")
-def set_default_user(user_id: int):
+def set_default_user(user_id: int, auth_user: dict = Depends(_require_auth_user)):
+    _require_admin_user(auth_user)
     repo = UserRepository()
     repo.set_default(user_id)
     return {"ok": True}
 
 
 @app.patch("/users/{user_id}/role")
-def update_user_role(user_id: int, payload: UserRoleUpdate):
+def update_user_role(user_id: int, payload: UserRoleUpdate, auth_user: dict = Depends(_require_auth_user)):
+    _require_admin_user(auth_user)
     if payload.role not in {"admin", "manager", "collab"}:
         raise HTTPException(status_code=400, detail="Role inválida")
     repo = UserRepository()
@@ -368,35 +544,40 @@ def update_user_role(user_id: int, payload: UserRoleUpdate):
 
 
 @app.get("/settings/server", response_model=ServerSettingsOut)
-def get_server_settings(user_id: int = Query(...)):
-    _require_admin(user_id)
+def get_server_settings(user_id: Optional[int] = Query(None), auth_user: dict = Depends(_require_auth_user)):
+    _require_admin_user(auth_user)
+    _resolve_query_user_id(auth_user, user_id)
     repo = SettingsRepository()
     return repo.get_server()
 
 
 @app.patch("/settings/server", response_model=ServerSettingsOut)
-def update_server_settings(payload: ServerSettingsUpdate, user_id: int = Query(...)):
-    _require_admin(user_id)
+def update_server_settings(payload: ServerSettingsUpdate, user_id: Optional[int] = Query(None), auth_user: dict = Depends(_require_auth_user)):
+    _require_admin_user(auth_user)
+    _resolve_query_user_id(auth_user, user_id)
     repo = SettingsRepository()
     return repo.set_server(payload.model_dump())
 
 
 @app.get("/settings/email", response_model=EmailSettingsOut)
-def get_email_settings(user_id: int = Query(...)):
-    _require_admin(user_id)
+def get_email_settings(user_id: Optional[int] = Query(None), auth_user: dict = Depends(_require_auth_user)):
+    _require_admin_user(auth_user)
+    _resolve_query_user_id(auth_user, user_id)
     repo = SettingsRepository()
     return repo.get_email()
 
 
 @app.patch("/settings/email", response_model=EmailSettingsOut)
-def update_email_settings(payload: EmailSettingsUpdate, user_id: int = Query(...)):
-    _require_admin(user_id)
+def update_email_settings(payload: EmailSettingsUpdate, user_id: Optional[int] = Query(None), auth_user: dict = Depends(_require_auth_user)):
+    _require_admin_user(auth_user)
+    _resolve_query_user_id(auth_user, user_id)
     repo = SettingsRepository()
     return repo.set_email(payload.model_dump())
 
 
 @app.get("/companies", response_model=List[CompanyOut])
 def list_companies(
+    request: Request,
     user_id: Optional[int] = Query(None),
     query: str = "",
     regime: Optional[str] = None,
@@ -404,16 +585,20 @@ def list_companies(
 ):
     _ensure_monthly_tasks_synced()
     repo = CompanyRepository()
+    auth_user = request.state.auth_user
+    scope_user_id = _resolve_query_user_id(auth_user, user_id)
+    role = str(auth_user.get("role") or "collab")
+
     responsavel_id: Optional[int] = None
-    if user_id is not None:
-        role = _get_role(user_id)
-        if _can_view_all(role):
-            user_id = None
-        else:
-            responsavel_id = user_id
-            user_id = None
+    list_user_id: Optional[int] = scope_user_id
+    if _can_view_all(role):
+        list_user_id = None
+    else:
+        responsavel_id = scope_user_id
+        list_user_id = None
+
     return repo.list(
-        user_id,
+        list_user_id,
         responsavel_id=responsavel_id,
         query=query,
         regime=regime,
@@ -422,19 +607,23 @@ def list_companies(
 
 
 @app.post("/companies", response_model=CompanyOut)
-def create_company(payload: CompanyCreate):
-    role = _get_role(payload.user_id)
+def create_company(payload: CompanyCreate, request: Request):
+    auth_user = request.state.auth_user
+    actor_id = int(auth_user["id"])
+    role = str(auth_user.get("role") or "collab")
+
     if role == "manager":
         raise HTTPException(status_code=403, detail="Manager não pode criar empresas.")
     if role in {"admin", "manager"} and payload.responsavel_id is None:
         raise HTTPException(status_code=400, detail="responsavel_id é obrigatório")
     if role == "collab":
-        if payload.responsavel_id is not None and int(payload.responsavel_id) != int(payload.user_id):
+        if payload.responsavel_id is not None and int(payload.responsavel_id) != actor_id:
             raise HTTPException(status_code=403, detail="Collab não pode atribuir outro responsável.")
-        payload.responsavel_id = payload.user_id
+        payload.responsavel_id = actor_id
+
     repo = CompanyRepository()
     new_id = repo.create(
-        user_id=payload.user_id,
+        user_id=actor_id,
         nome=payload.nome,
         cnpj=payload.cnpj,
         ie=payload.ie,
@@ -459,16 +648,20 @@ def create_company(payload: CompanyCreate):
 
 
 @app.patch("/companies/{company_id}", response_model=CompanyOut)
-def update_company(company_id: int, payload: CompanyUpdate, user_id: int = Query(...)):
-    role = _get_role(user_id)
+def update_company(company_id: int, payload: CompanyUpdate, request: Request, user_id: Optional[int] = Query(None)):
+    auth_user = request.state.auth_user
+    actor_id = _resolve_query_user_id(auth_user, user_id)
+    role = str(auth_user.get("role") or "collab")
+
     if role == "manager":
         raise HTTPException(status_code=403, detail="Manager não pode editar empresas.")
     if role == "collab":
-        if payload.responsavel_id is not None and int(payload.responsavel_id) != int(user_id):
+        if payload.responsavel_id is not None and int(payload.responsavel_id) != int(actor_id):
             raise HTTPException(status_code=403, detail="Collab não pode atribuir outro responsável.")
+
     repo = CompanyRepository()
     repo.update(
-        user_id=None if role == "admin" else user_id,
+        user_id=None if role == "admin" else actor_id,
         company_id=company_id,
         nome=payload.nome,
         cnpj=payload.cnpj,
@@ -493,23 +686,29 @@ def update_company(company_id: int, payload: CompanyUpdate, user_id: int = Query
     }
 
 
-
 @app.patch("/companies/{company_id}/responsavel", response_model=CompanyOut)
-def update_company_responsavel(company_id: int, payload: dict, user_id: int = Query(...)):
-    role = _get_role(user_id)
+def update_company_responsavel(company_id: int, payload: dict, request: Request, user_id: Optional[int] = Query(None)):
+    auth_user = request.state.auth_user
+    _resolve_query_user_id(auth_user, user_id)
+    role = str(auth_user.get("role") or "collab")
+
     if role not in {"admin", "manager"}:
         raise HTTPException(status_code=403, detail="Sem permissão para trocar responsável.")
     responsavel_id = payload.get("responsavel_id")
     if responsavel_id is None:
         raise HTTPException(status_code=400, detail="responsavel_id é obrigatório")
+
     repo = CompanyRepository()
     repo.update_responsavel(company_id, int(responsavel_id))
     updated = repo.get(company_id)
     if not updated:
         raise HTTPException(status_code=404, detail="Empresa não encontrada.")
     return updated
+
+
 @app.get("/tasks", response_model=List[TaskOut])
 def list_tasks(
+    request: Request,
     user_id: Optional[int] = Query(None),
     company_id: Optional[int] = None,
     status: Optional[List[str]] = Query(None),
@@ -518,12 +717,14 @@ def list_tasks(
 ):
     _ensure_monthly_tasks_synced()
     repo = TaskRepository()
-    if user_id is not None:
-        role = _get_role(user_id)
-        if _can_view_all(role):
-            user_id = None
+
+    auth_user = request.state.auth_user
+    scope_user_id = _resolve_query_user_id(auth_user, user_id)
+    role = str(auth_user.get("role") or "collab")
+    list_user_id = None if _can_view_all(role) else scope_user_id
+
     rows = repo.list(
-        user_id=user_id,
+        user_id=list_user_id,
         company_id=company_id,
         status=status,
         tipo=tipo,
@@ -540,16 +741,19 @@ def list_tasks(
 
 @app.get("/tasks/upcoming", response_model=List[TaskOut])
 def list_upcoming_tasks(
+    request: Request,
     user_id: Optional[int] = Query(None),
     days: int = 7,
     prev_competencia: bool = False,
 ):
     _ensure_monthly_tasks_synced()
     repo = TaskRepository()
-    if user_id is not None:
-        role = _get_role(user_id)
-        if _can_view_all(role):
-            user_id = None
+
+    auth_user = request.state.auth_user
+    scope_user_id = _resolve_query_user_id(auth_user, user_id)
+    role = str(auth_user.get("role") or "collab")
+    list_user_id = None if _can_view_all(role) else scope_user_id
+
     competencia = None
     if prev_competencia:
         today = date.today()
@@ -559,7 +763,8 @@ def list_upcoming_tasks(
             month = 12
             year -= 1
         competencia = f"{year}{str(month).zfill(2)}"
-    rows = repo.list_upcoming(user_id=user_id, days=days, competencia=competencia)
+
+    rows = repo.list_upcoming(user_id=list_user_id, days=days, competencia=competencia)
     return [
         {
             **r,
@@ -570,13 +775,21 @@ def list_upcoming_tasks(
 
 
 @app.post("/tasks", response_model=TaskOut)
-def create_task(payload: TaskCreate):
-    role = _get_role(payload.user_id)
+def create_task(payload: TaskCreate, request: Request):
+    auth_user = request.state.auth_user
+    actor_id = int(auth_user["id"])
+    role = str(auth_user.get("role") or "collab")
+
     if role == "manager":
         raise HTTPException(status_code=403, detail="Manager não pode criar tarefas.")
+
+    target_user_id = actor_id
+    if role == "admin" and payload.user_id:
+        target_user_id = int(payload.user_id)
+
     repo = TaskRepository()
     new_id = repo.create(
-        user_id=payload.user_id,
+        user_id=target_user_id,
         company_id=payload.company_id,
         titulo=payload.titulo,
         tipo=payload.tipo,
@@ -601,34 +814,46 @@ def create_task(payload: TaskCreate):
 
 
 @app.patch("/tasks/{task_id}/status")
-def update_status(task_id: int, payload: TaskStatusUpdate, user_id: int = Query(...)):
-    role = _get_role(user_id)
+def update_status(task_id: int, payload: TaskStatusUpdate, request: Request, user_id: Optional[int] = Query(None)):
+    auth_user = request.state.auth_user
+    scope_user_id = _resolve_query_user_id(auth_user, user_id)
+    role = str(auth_user.get("role") or "collab")
+
     if role == "manager":
         raise HTTPException(status_code=403, detail="Manager não pode editar tarefas.")
+
     repo = TaskRepository()
-    old = repo.get(task_id, None if role == "admin" else user_id)
+    old = repo.get(task_id, None if role == "admin" else scope_user_id)
     if not old:
         raise HTTPException(status_code=404, detail="Tarefa não encontrada.")
-    repo.update_status(task_id, None if role == "admin" else user_id, payload.status)
+
+    repo.update_status(task_id, None if role == "admin" else scope_user_id, payload.status)
     TaskLogRepository().create(
         task_id=task_id,
-        user_id=user_id,
+        user_id=scope_user_id,
         action="status",
         details=f"{old.get('status')} -> {payload.status}",
     )
     return {"ok": True}
+
+
 @app.patch("/tasks/{task_id}", response_model=TaskOut)
-def update_task(task_id: int, payload: TaskUpdate, user_id: int = Query(...)):
-    role = _get_role(user_id)
+def update_task(task_id: int, payload: TaskUpdate, request: Request, user_id: Optional[int] = Query(None)):
+    auth_user = request.state.auth_user
+    scope_user_id = _resolve_query_user_id(auth_user, user_id)
+    role = str(auth_user.get("role") or "collab")
+
     if role == "manager":
         raise HTTPException(status_code=403, detail="Manager não pode editar tarefas.")
+
     repo = TaskRepository()
-    old = repo.get(task_id, None if role == "admin" else user_id)
+    old = repo.get(task_id, None if role == "admin" else scope_user_id)
     if not old:
         raise HTTPException(status_code=404, detail="Tarefa não encontrada.")
+
     repo.update(
         task_id=task_id,
-        user_id=None if role == "admin" else user_id,
+        user_id=None if role == "admin" else scope_user_id,
         titulo=payload.titulo,
         tipo=payload.tipo,
         orgao=payload.orgao,
@@ -637,48 +862,61 @@ def update_task(task_id: int, payload: TaskUpdate, user_id: int = Query(...)):
         vencimento=payload.vencimento,
         status=payload.status,
     )
+
     changes = []
     for field in ["titulo", "tipo", "orgao", "tributo", "competencia", "vencimento", "status"]:
         if str(old.get(field) or "") != str(getattr(payload, field) or ""):
             changes.append(f"{field}: {old.get(field)} -> {getattr(payload, field)}")
+
     TaskLogRepository().create(
         task_id=task_id,
-        user_id=user_id,
+        user_id=scope_user_id,
         action="update",
         details=("; ".join(changes) if changes else "sem mudanças"),
     )
-    return repo.get(task_id, None if role == "admin" else user_id)
+    return repo.get(task_id, None if role == "admin" else scope_user_id)
+
+
 @app.post("/tasks/{task_id}/pdf")
-async def upload_pdf(task_id: int, user_id: int = Query(...), file: UploadFile = File(...)):
-    role = _get_role(user_id)
+async def upload_pdf(task_id: int, request: Request, user_id: Optional[int] = Query(None), file: UploadFile = File(...)):
+    auth_user = request.state.auth_user
+    scope_user_id = _resolve_query_user_id(auth_user, user_id)
+    role = str(auth_user.get("role") or "collab")
+
     if role == "manager":
         raise HTTPException(status_code=403, detail="Manager não pode editar tarefas.")
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Somente PDF.")
     data = await file.read()
+    if len(data) > MAX_PDF_BYTES:
+        raise HTTPException(status_code=413, detail=f"Arquivo excede limite de {MAX_PDF_MB}MB.")
     repo = TaskRepository()
-    repo.update_pdf(task_id, None if role == "admin" else user_id, file.filename, data)
+    repo.update_pdf(task_id, None if role == "admin" else scope_user_id, file.filename, data)
+
     TaskLogRepository().create(
         task_id=task_id,
-        user_id=user_id,
+        user_id=scope_user_id,
         action="upload_pdf",
         details=file.filename,
     )
+
     classification = classify_filename(file.filename)
     status = "ok" if classification.get("tributo") else "needs_review"
     classification["status"] = status
     classification["task_id"] = task_id
-    classification["user_id"] = user_id
+    classification["user_id"] = scope_user_id
+
     suggestions = []
     if status != "ok":
-        task_row = repo.get(task_id, None if role == "admin" else user_id)
+        task_row = repo.get(task_id, None if role == "admin" else scope_user_id)
         if task_row:
             suggestions = repo.find_similar(company_id=int(task_row["company_id"]), text=classification.get("raw_text") or "")
+
     json_path = save_classification_json(classification)
     class_repo = ClassificationRepository()
     class_repo.create(
         task_id=task_id,
-        user_id=user_id,
+        user_id=scope_user_id,
         filename=file.filename,
         competencia=classification.get("competencia"),
         empresa=classification.get("empresa") or "",
@@ -692,7 +930,8 @@ async def upload_pdf(task_id: int, user_id: int = Query(...), file: UploadFile =
         status=status,
         raw_text=classification.get("raw_text") or "",
     )
-    task_row = repo.get(task_id, None if role == "admin" else user_id)
+
+    task_row = repo.get(task_id, None if role == "admin" else scope_user_id)
     if task_row:
         company = CompanyRepository().get(int(task_row["company_id"]))
         text_pdf = _extract_pdf_text(data)
@@ -712,7 +951,7 @@ async def upload_pdf(task_id: int, user_id: int = Query(...), file: UploadFile =
         if issues:
             TaskLogRepository().create(
                 task_id=task_id,
-                user_id=user_id,
+                user_id=scope_user_id,
                 action="inconsistency",
                 details="; ".join(issues),
             )
@@ -728,63 +967,77 @@ async def upload_pdf(task_id: int, user_id: int = Query(...), file: UploadFile =
     return {"ok": True, "classification": classification, "json_path": json_path, "suggestions": suggestions}
 
 
-
 @app.get("/tasks/{task_id}/logs", response_model=List[TaskLogOut])
-def list_task_logs(task_id: int, user_id: int = Query(...)):
-    role = _get_role(user_id)
+def list_task_logs(task_id: int, request: Request, user_id: Optional[int] = Query(None)):
+    auth_user = request.state.auth_user
+    scope_user_id = _resolve_query_user_id(auth_user, user_id)
+    role = str(auth_user.get("role") or "collab")
+
     repo = TaskRepository()
-    task = repo.get(task_id, None if _can_view_all(role) else user_id)
+    task = repo.get(task_id, None if _can_view_all(role) else scope_user_id)
     if not task:
         raise HTTPException(status_code=404, detail="Tarefa não encontrada.")
     return TaskLogRepository().list(task_id=task_id)
 
 
 @app.get("/tasks/{task_id}/comments", response_model=List[TaskCommentOut])
-def list_task_comments(task_id: int, user_id: int = Query(...)):
-    role = _get_role(user_id)
+def list_task_comments(task_id: int, request: Request, user_id: Optional[int] = Query(None)):
+    auth_user = request.state.auth_user
+    scope_user_id = _resolve_query_user_id(auth_user, user_id)
+    role = str(auth_user.get("role") or "collab")
+
     repo = TaskRepository()
-    task = repo.get(task_id, None if _can_view_all(role) else user_id)
+    task = repo.get(task_id, None if _can_view_all(role) else scope_user_id)
     if not task:
         raise HTTPException(status_code=404, detail="Tarefa não encontrada.")
     return TaskCommentRepository().list(task_id=task_id)
 
 
 @app.post("/tasks/{task_id}/comments", response_model=TaskCommentOut)
-def create_task_comment(task_id: int, payload: TaskCommentCreate, user_id: int = Query(...)):
-    role = _get_role(user_id)
+def create_task_comment(task_id: int, payload: TaskCommentCreate, request: Request, user_id: Optional[int] = Query(None)):
+    auth_user = request.state.auth_user
+    scope_user_id = _resolve_query_user_id(auth_user, user_id)
+    role = str(auth_user.get("role") or "collab")
+
     if role not in {"admin", "manager"}:
         raise HTTPException(status_code=403, detail="Sem permissão para comentar.")
+
     repo = TaskRepository()
-    task = repo.get(task_id, None if _can_view_all(role) else user_id)
+    task = repo.get(task_id, None if _can_view_all(role) else scope_user_id)
     if not task:
         raise HTTPException(status_code=404, detail="Tarefa não encontrada.")
+
     comment_repo = TaskCommentRepository()
-    new_id = comment_repo.create(task_id=task_id, author_id=user_id, text=payload.text)
-    # notificação para o responsável pela tarefa
+    new_id = comment_repo.create(task_id=task_id, author_id=scope_user_id, text=payload.text)
+
     NotificationRepository().create(
         user_id=int(task.get("user_id")),
         type="comment",
         ref_id=int(task_id),
         message=f"Novo comentário na tarefa {task.get('titulo')} (id {task_id})",
     )
+
     created = comment_repo.get(new_id)
     return created or {
         "id": new_id,
         "task_id": task_id,
-        "author_id": user_id,
+        "author_id": scope_user_id,
         "text": payload.text,
         "created_at": "",
     }
 
 
 @app.post("/tasks/{task_id}/comments/{comment_id}/ack")
-def acknowledge_task_comment(task_id: int, comment_id: int, user_id: int = Query(...)):
-    role = _get_role(user_id)
+def acknowledge_task_comment(task_id: int, comment_id: int, request: Request, user_id: Optional[int] = Query(None)):
+    auth_user = request.state.auth_user
+    scope_user_id = _resolve_query_user_id(auth_user, user_id)
+    role = str(auth_user.get("role") or "collab")
+
     if role not in {"admin", "collab"}:
         raise HTTPException(status_code=403, detail="Apenas administrador/colaborador podem confirmar.")
 
     task_repo = TaskRepository()
-    task = task_repo.get(task_id, None if _can_view_all(role) else user_id)
+    task = task_repo.get(task_id, None if _can_view_all(role) else scope_user_id)
     if not task:
         raise HTTPException(status_code=404, detail="Tarefa não encontrada.")
 
@@ -797,7 +1050,8 @@ def acknowledge_task_comment(task_id: int, comment_id: int, user_id: int = Query
         raise HTTPException(status_code=400, detail="Somente comentário de coordenador pode ser confirmado.")
 
     users = UserRepository().list()
-    actor_name = next((str(u.get("nome") or "") for u in users if int(u.get("id") or 0) == int(user_id)), f"Usuário {user_id}")
+    actor_name = next((str(u.get("nome") or "") for u in users if int(u.get("id") or 0) == int(scope_user_id)), f"Usuário {scope_user_id}")
+
     notif_repo = NotificationRepository()
     notif_repo.create(
         user_id=int(comment["author_id"]),
@@ -805,9 +1059,10 @@ def acknowledge_task_comment(task_id: int, comment_id: int, user_id: int = Query
         ref_id=int(task_id),
         message=f"{actor_name} conferiu seu comentário na tarefa {task.get('titulo')} (id {task_id})",
     )
+
     TaskLogRepository().create(
         task_id=task_id,
-        user_id=user_id,
+        user_id=scope_user_id,
         action="comment_ack",
         details=f"comment_id={comment_id}",
     )
@@ -815,9 +1070,12 @@ def acknowledge_task_comment(task_id: int, comment_id: int, user_id: int = Query
 
 
 @app.get("/notifications", response_model=List[NotificationOut])
-def list_notifications(user_id: int = Query(...), unread_only: bool = False):
+def list_notifications(request: Request, user_id: Optional[int] = Query(None), unread_only: bool = False):
+    auth_user = request.state.auth_user
+    scope_user_id = _resolve_query_user_id(auth_user, user_id)
+
     repo = NotificationRepository()
-    rows = repo.list(user_id=user_id, unread_only=unread_only)
+    rows = repo.list(user_id=scope_user_id, unread_only=unread_only)
     return [
         {
             **r,
@@ -828,17 +1086,26 @@ def list_notifications(user_id: int = Query(...), unread_only: bool = False):
 
 
 @app.patch("/notifications/{notification_id}/read")
-def mark_notification_read(notification_id: int, user_id: int = Query(...)):
+def mark_notification_read(notification_id: int, request: Request, user_id: Optional[int] = Query(None)):
+    auth_user = request.state.auth_user
+    scope_user_id = _resolve_query_user_id(auth_user, user_id)
+
     repo = NotificationRepository()
-    repo.mark_read(notification_id, user_id)
+    repo.mark_read(notification_id, scope_user_id)
     return {"ok": True}
+
+
 @app.get("/tasks/{task_id}/pdf")
-def download_pdf(task_id: int, user_id: int = Query(...)):
-    role = _get_role(user_id)
+def download_pdf(task_id: int, request: Request, user_id: Optional[int] = Query(None)):
+    auth_user = request.state.auth_user
+    scope_user_id = _resolve_query_user_id(auth_user, user_id)
+    role = str(auth_user.get("role") or "collab")
+
     repo = TaskRepository()
-    row = repo.get_pdf(task_id, None if _can_view_all(role) else user_id)
+    row = repo.get_pdf(task_id, None if _can_view_all(role) else scope_user_id)
     if not row or not row.get("pdf_blob"):
         raise HTTPException(status_code=404, detail="PDF não encontrado.")
+
     data = row["pdf_blob"]
     filename = row.get("pdf_path") or f"task_{task_id}.pdf"
     return StreamingResponse(
@@ -846,7 +1113,3 @@ def download_pdf(task_id: int, user_id: int = Query(...)):
         media_type="application/pdf",
         headers={"Content-Disposition": f'inline; filename="{filename}"'},
     )
-
-
-
-

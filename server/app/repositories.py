@@ -17,10 +17,10 @@ class UserRepository:
         conn.close()
         return [dict(r) for r in rows]
 
-    def create(self, nome: str, role: str = "collab", is_default: bool = False, senha: str = "1234") -> int:
+    def create(self, nome: str, role: str = "collab", is_default: bool = False, senha: str = "") -> int:
         nome = (nome or "").strip()
         if not nome:
-            raise ValueError("Nome do usuário é obrigatório")
+            raise ValueError("Nome do usuario e obrigatorio")
         conn = _connect()
         cur = conn.cursor()
         if is_default:
@@ -43,6 +43,24 @@ class UserRepository:
         ).fetchone()
         conn.close()
         return dict(row) if row else None
+
+
+    def get(self, user_id: int) -> Optional[Dict[str, object]]:
+        conn = _connect()
+        cur = conn.cursor()
+        row = cur.execute(
+            "SELECT id, nome, role, is_default, senha FROM usuarios WHERE id = ?",
+            (int(user_id),),
+        ).fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def count(self) -> int:
+        conn = _connect()
+        cur = conn.cursor()
+        row = cur.execute("SELECT COUNT(*) as total FROM usuarios").fetchone()
+        conn.close()
+        return int(row["total"] if row else 0)
 
     def set_default(self, user_id: int) -> None:
         conn = _connect()
@@ -76,7 +94,7 @@ class UserRepository:
             conn.close()
             return None
 
-        # Migração transparente para hash forte em logins de contas antigas.
+        # Migracao transparente para hash forte em logins de contas antigas.
         if not is_password_hash(stored):
             cur.execute(
                 "UPDATE usuarios SET senha = ? WHERE id = ?",
@@ -251,7 +269,7 @@ class CompanyRepository:
     ) -> int:
         nome = (nome or "").strip()
         if not nome:
-            raise ValueError("Nome da empresa é obrigatório")
+            raise ValueError("Nome da empresa e obrigatorio")
         conn = _connect()
         cur = conn.cursor()
         cur.execute(
@@ -866,3 +884,4 @@ class SettingsRepository:
             current["smtp_port"] = 587
         self._set_json("email", current)
         return current
+

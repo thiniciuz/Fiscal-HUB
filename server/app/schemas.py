@@ -15,7 +15,7 @@ class UserCreate(BaseModel):
     nome: str
     role: str = "collab"
     is_default: bool = False
-    senha: str = "1234"
+    senha: str = ""
 
 
 class UserRoleUpdate(BaseModel):
@@ -26,6 +26,12 @@ class UserLogin(BaseModel):
     nome: str
     senha: str
 
+
+
+class AuthLoginOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserOut
 
 class CompanyOut(BaseModel):
     id: int
@@ -191,3 +197,4 @@ class EmailSettingsUpdate(BaseModel):
     smtp_pass: str = ""
     smtp_sender: str = ""
     smtp_tls: bool = True
+

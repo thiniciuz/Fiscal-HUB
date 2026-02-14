@@ -19,7 +19,7 @@ def is_password_hash(value: str) -> bool:
 def hash_password(password: str) -> str:
     plain = str(password or "").strip()
     if not plain:
-        plain = "1234"
+        raise ValueError("Senha vazia nao permitida")
     salt = os.urandom(16)
     digest = hashlib.pbkdf2_hmac(_ALGO, plain.encode("utf-8"), salt, _ITERATIONS)
     salt_b64 = base64.b64encode(salt).decode("ascii")
